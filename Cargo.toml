@@ -1,0 +1,9 @@
+[package]
+name = "redis-sentinel"
+version = "0.1.0"
+authors = ["Gabriel Féron <feron.gabriel@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+redis = { version = "0.19", features = ["tokio-comp"] } # TODO: add feature flags to work with both tokio and async-std
+log = "0.4"
