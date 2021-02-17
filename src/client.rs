@@ -40,12 +40,14 @@ impl ClusterClient {
     /// see: https://redis.io/topics/sentinel#obtaining-the-address-of-the-current-master
     pub fn get_master_addr(
         master_group_name: &str,
-        sentinel_client: &mut redis::Client,
+        sentinel_client: &redis::Client,
     ) -> redis::RedisResult<redis::ConnectionInfo> {
+        let mut sentinel_conn = sentinel_client.get_connection()?;
+        
         let (master_addr, master_port): (String, u16) = redis::cmd("SENTINEL")
             .arg("get-master-addr-by-name")
             .arg(master_group_name)
-            .query(sentinel_client)?;
+            .query(&mut sentinel_conn)?;
         let master_addr = format!("redis://{}:{}", master_addr, master_port);
         trace!("got redis addr from sentinel: {}", master_addr);
         master_addr.into_connection_info()
@@ -53,12 +55,12 @@ impl ClusterClient {
 
     /// Returns the current `redis::Connection` or tries to reconnect to the advertised
     /// master node.
-    pub fn get_connection(&mut self) -> redis::RedisResult<redis::Connection> {
+    pub fn get_connection(&self) -> redis::RedisResult<redis::Connection> {
         match self.client.get_connection() {
             // when we fail here, we try to reconnect to the new master node
             Err(e) if e.kind() == ErrorKind::IoError => {
                 let master_addr =
-                    Self::get_master_addr(&self.master_group_name, &mut self.sentinel_client)?;
+                    Self::get_master_addr(&self.master_group_name, &self.sentinel_client)?;
                 redis::Client::open(master_addr)?.get_connection()
             }
             r => r,
@@ -68,13 +70,13 @@ impl ClusterClient {
     /// Returns the current `redis::aio::Connection` or tries to reconnected to
     /// the advertised master node.
     pub async fn get_connection_async(
-        &mut self,
+        &self,
     ) -> Result<redis::aio::Connection, redis::RedisError> {
         match self.client.get_async_connection().await {
             // when we fail here, we try to reconnect
             Err(e) if e.kind() == ErrorKind::IoError => {
                 let master_addr =
-                    Self::get_master_addr(&self.master_group_name, &mut self.sentinel_client)?;
+                    Self::get_master_addr(&self.master_group_name, &self.sentinel_client)?;
                 redis::Client::open(master_addr)?
                     .get_async_connection()
                     .await
