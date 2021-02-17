@@ -5,4 +5,4 @@
 
 mod client;
 
-pub use client::ClusterClient;
+pub use client::SentinelClient;
