@@ -15,6 +15,7 @@ pub struct SentinelClient {
     /// used for querying addressed of master node(s).
     sentinel_nodes: Vec<redis::Client>,
     master_node: Option<redis::Client>,
+    param_template: ConnectionInfo,
     master_group_name: String,
 }
 
@@ -23,8 +24,12 @@ impl SentinelClient {
     /// returns a client pointing to the current master. This does not
     /// actually open a connection yet but it does perform some basic
     /// checks on the URL that might make the operation fail.
+    /// 
+    /// Parameter `param_template` is used for configuration of connections to master 
+    /// nodes, but has its address overwritten.
     pub fn open<T: redis::IntoConnectionInfo>(
         sentinel_nodes: Vec<T>,
+        param_template: T,
         master_group_name: String,
     ) -> RedisResult<Self> {
         let sentinel_nodes: RedisResult<Vec<ConnectionInfo>> = sentinel_nodes
@@ -40,6 +45,7 @@ impl SentinelClient {
         Ok(Self {
             sentinel_nodes,
             master_node: None,
+            param_template: param_template.into_connection_info()?,
             master_group_name,
         })
     }
@@ -88,7 +94,9 @@ impl SentinelClient {
 
         // step 2): ask for master address
         let master_addr = self.ask_for_master_addr(&mut sentinel_conn)?;
-        let master_node = redis::Client::open(master_addr)?;
+        let mut master_info = self.param_template.clone();
+        master_info.addr = master_addr.addr;
+        let master_node = redis::Client::open(master_info)?;
 
         // step 3): verify it is actually a master
         let master_conn = Self::verify_master_node(&master_node).await?;
