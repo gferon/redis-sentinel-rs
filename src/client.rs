@@ -1,87 +1,165 @@
 use log::trace;
-use redis::{ErrorKind, IntoConnectionInfo};
+use redis::{
+    aio::Connection, Client, ConnectionInfo, ErrorKind, IntoConnectionInfo, RedisError, RedisResult,
+};
+use std::{str::from_utf8, time::Duration};
+
+const SENTINEL_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Enables connecting to a cluster of redis instance configured
-/// in high-availability mode and monitored by sentinel
+/// in high-availability mode and monitored by sentinel.
 ///
 /// see: https://redis.io/topics/sentinel
 #[derive(Debug, Clone)]
 pub struct SentinelClient {
-    /// connects to any available sentinel and fetches the IP of the master node
-    sentinel_client: redis::Client,
-    client: redis::Client,
+    /// used for querying addressed of master node(s).
+    sentinel_nodes: Vec<redis::Client>,
+    master_node: Option<redis::Client>,
     master_group_name: String,
-    namespace: String,
 }
 
 impl SentinelClient {
     /// Connects to a redis-server in sentinel mode (used in redis clusters) and
-    /// return a client pointing to the current master.
-    /// This opens a short-lived connection to the sentinal server, then uses the
-    /// regular `RedisClient`
-    pub fn try_open_with_sentinel<T: redis::IntoConnectionInfo>(
-        master_group_name: &str,
-        params: T,
-        namespace: &str,
-    ) -> redis::RedisResult<Self> {
-        let connection_info = params.into_connection_info()?;
-        let mut sentinel_client = redis::Client::open(connection_info)?;
-        let master_addr = Self::get_master_addr(&master_group_name, &mut sentinel_client)?;
+    /// returns a client pointing to the current master. This does not
+    /// actually open a connection yet but it does perform some basic
+    /// checks on the URL that might make the operation fail.
+    pub fn open<T: redis::IntoConnectionInfo>(
+        sentinel_nodes: Vec<T>,
+        master_group_name: String,
+    ) -> RedisResult<Self> {
+        let sentinel_nodes: RedisResult<Vec<ConnectionInfo>> = sentinel_nodes
+            .into_iter()
+            .map(|i| i.into_connection_info())
+            .collect();
+
+        let sentinel_nodes = sentinel_nodes?
+            .into_iter()
+            .map(|info| redis::Client::open(info))
+            .collect::<RedisResult<Vec<Client>>>()?;
+
         Ok(Self {
-            master_group_name: master_group_name.to_owned(),
-            sentinel_client,
-            client: redis::Client::open(master_addr)?,
-            namespace: namespace.into(),
+            sentinel_nodes,
+            master_node: None,
+            master_group_name,
         })
     }
 
-    /// Queries the address of the current Redis master node
+    async fn find_master(&mut self) -> RedisResult<Connection> {
+        let mut master: Option<RedisResult<_>> = None;
+        for (index, sentinel_node) in self.sentinel_nodes.iter().enumerate() {
+            trace!("trying to connect to sentinel {:?}", sentinel_node);
+
+            let res = self.find_master_using_sentinel(sentinel_node).await;
+            let is_ok = res.is_ok();
+            master = Some(res.map(|c| (index, c)));
+
+            if is_ok {
+                break;
+            }
+        }
+
+        if master.is_none() {
+            return Err(RedisError::from((
+                ErrorKind::InvalidClientConfig,
+                "no sentinel nodes provided",
+            )));
+        }
+        let (sentinel_index, (master_node, master_conn)) = master.unwrap()?;
+
+        self.master_node = Some(master_node);
+
+        // move connected node to start to minimize retries on reconnection
+        if sentinel_index != 0 {
+            let connected_node = self.sentinel_nodes.remove(sentinel_index);
+            self.sentinel_nodes.insert(0, connected_node);
+        }
+
+        Ok(master_conn)
+    }
+
+    /// Returns master node client pointed to by the sentinel.
+    /// See: https://redis.io/topics/sentinel-clients
+    async fn find_master_using_sentinel(
+        &self,
+        sentinel_node: &Client,
+    ) -> redis::RedisResult<(Client, Connection)> {
+        // step 1): open connection
+        let mut sentinel_conn = sentinel_node.get_connection_with_timeout(SENTINEL_TIMEOUT)?;
+
+        // step 2): ask for master address
+        let master_addr = self.ask_for_master_addr(&mut sentinel_conn)?;
+        let master_node = redis::Client::open(master_addr)?;
+
+        // step 3): verify it is actually a master
+        let master_conn = Self::verify_master_node(&master_node).await?;
+
+        Ok((master_node, master_conn))
+    }
+
+    /// Queries a sentinel node for the address of the current Redis master node.
     ///
-    /// see: https://redis.io/topics/sentinel#obtaining-the-address-of-the-current-master
-    pub fn get_master_addr(
-        master_group_name: &str,
-        sentinel_client: &redis::Client,
-    ) -> redis::RedisResult<redis::ConnectionInfo> {
-        let mut sentinel_conn = sentinel_client.get_connection()?;
-        
+    /// see step 2 of: https://redis.io/topics/sentinel-clients
+    fn ask_for_master_addr(
+        &self,
+        sentinel_conn: &mut redis::Connection,
+    ) -> redis::RedisResult<ConnectionInfo> {
         let (master_addr, master_port): (String, u16) = redis::cmd("SENTINEL")
             .arg("get-master-addr-by-name")
-            .arg(master_group_name)
-            .query(&mut sentinel_conn)?;
+            .arg(&self.master_group_name)
+            .query(sentinel_conn)?;
         let master_addr = format!("redis://{}:{}", master_addr, master_port);
-        trace!("got redis addr from sentinel: {}", master_addr);
+
+        trace!("got redis addr {} from sentinel", master_addr);
         master_addr.into_connection_info()
     }
 
-    /// Returns the current `redis::Connection` or tries to reconnect to the advertised
-    /// master node.
-    pub fn get_connection(&self) -> redis::RedisResult<redis::Connection> {
-        match self.client.get_connection() {
-            // when we fail here, we try to reconnect to the new master node
-            Err(e) if e.kind() == ErrorKind::IoError => {
-                let master_addr =
-                    Self::get_master_addr(&self.master_group_name, &self.sentinel_client)?;
-                redis::Client::open(master_addr)?.get_connection()
+    /// Verifies that a node is actually master node.
+    ///
+    /// see step 3 of: https://redis.io/topics/sentinel-clients
+    async fn verify_master_node(master_node: &Client) -> redis::RedisResult<Connection> {
+        let mut conn = master_node.get_async_connection().await?;
+
+        let role: redis::Value = redis::cmd("ROLE").query_async(&mut conn).await?;
+
+        // ROLE returns a complex response, so we cannot use the usual type-casting
+        if let redis::Value::Bulk(parts) = role {
+            match &parts[..] {
+                [redis::Value::Data(data), ..] => {
+                    let role = from_utf8(&data).unwrap_or("");
+                    if role == "master" {
+                        trace!("verified node {:?} as master", master_node);
+                        Ok(conn)
+                    } else {
+                        Err(RedisError::from((
+                            ErrorKind::ResponseError,
+                            "sentinel pointed to master node but the node is not master",
+                        )))
+                    }
+                }
+                parts => Err(RedisError::from((
+                    ErrorKind::ResponseError,
+                    "ROLE returned unexpected data format",
+                    format!("expected [string-data(_), ..], got {:?}", parts),
+                ))),
             }
-            r => r,
+        } else {
+            Err(RedisError::from((
+                ErrorKind::ResponseError,
+                "ROLE returned unexpected data format",
+                format!("expected bulk([string-data(_), _]), got {:?}", role),
+            )))
         }
     }
 
     /// Returns the current `redis::aio::Connection` or tries to reconnected to
     /// the advertised master node.
-    pub async fn get_connection_async(
-        &self,
-    ) -> Result<redis::aio::Connection, redis::RedisError> {
-        match self.client.get_async_connection().await {
-            // when we fail here, we try to reconnect
-            Err(e) if e.kind() == ErrorKind::IoError => {
-                let master_addr =
-                    Self::get_master_addr(&self.master_group_name, &self.sentinel_client)?;
-                redis::Client::open(master_addr)?
-                    .get_async_connection()
-                    .await
+    pub async fn get_connection_async(&mut self) -> RedisResult<Connection> {
+        if let Some(master_client) = &self.master_node {
+            if let Ok(conn) = master_client.get_async_connection().await {
+                return Ok(conn);
             }
-            r => r,
         }
+
+        self.find_master().await
     }
 }
