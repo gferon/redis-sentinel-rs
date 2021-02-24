@@ -6,7 +6,7 @@ use redis::{ErrorKind, IntoConnectionInfo};
 ///
 /// see: https://redis.io/topics/sentinel
 #[derive(Debug, Clone)]
-pub struct ClusterClient {
+pub struct SentinelClient {
     /// connects to any available sentinel and fetches the IP of the master node
     sentinel_client: redis::Client,
     client: redis::Client,
@@ -14,7 +14,7 @@ pub struct ClusterClient {
     namespace: String,
 }
 
-impl ClusterClient {
+impl SentinelClient {
     /// Connects to a redis-server in sentinel mode (used in redis clusters) and
     /// return a client pointing to the current master.
     /// This opens a short-lived connection to the sentinal server, then uses the
