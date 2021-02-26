@@ -4,6 +4,19 @@ version = "0.1.0"
 authors = ["Gabriel Féron <feron.gabriel@gmail.com>"]
 edition = "2018"
 
+[features]
+default = ["aio"]
+aio = []
+
 [dependencies]
-redis = { version = "0.19", features = ["tokio-comp"] } # TODO: add feature flags to work with both tokio and async-std
+redis = { version = "0.20", features = ["cluster", "tokio-comp"] } # TODO: add feature flags to work with both tokio and async-std
 log = "0.4"
+
+[dev-dependencies]
+tempfile = "3.2"
+anyhow = "1.0"
+futures = "0.3"
+net2 = "0.2"
+rand = "0.8"
+backoff = "0.3"
+tokio = { version = "1.0", features = ["macros"] }

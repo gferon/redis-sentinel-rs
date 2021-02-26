@@ -5,4 +5,4 @@
 
 mod client;
 
-pub use client::SentinelClient;
+pub use client::{SentinelClient, SentinelMonitorCmd};
